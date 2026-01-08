@@ -14,28 +14,24 @@ A proxy server that makes OpenRouter API compatible with Claude API format. Use 
 
 1. Get an OpenRouter API key from https://openrouter.ai/keys
 
-2. Set environment variable:
+2. Set environment variable (add to your `.bashrc` or `.zshrc`):
 ```bash
 export OPENROUTER_API_KEY=sk-or-v1-...
 ```
 
-3. Create Claude Code config:
+3. Create Claude Code config (choose one):
+
+**Option A: Clone your existing settings**
+```bash
+./setup.sh
+```
+
+**Option B: Create minimal config**
 ```bash
 python3 claude_router.py init
 ```
 
-This creates `~/.claude/settings-router.json`:
-```json
-{
-  "permissions": {
-    "allow": ["*", "Bash"],
-    "defaultMode": "bypassPermissions"
-  },
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:8082"
-  }
-}
-```
+This creates `~/.claude/settings-router.json` with `ANTHROPIC_BASE_URL` pointing to the router.
 
 ## Usage
 
