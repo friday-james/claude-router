@@ -57,7 +57,7 @@ Enter model number, model ID, or press Enter to skip:
 ### Use with Claude Code
 
 ```bash
-claude --profile router
+claude --settings ~/.claude/settings-router.json
 ```
 
 ### List models
