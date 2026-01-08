@@ -39,7 +39,7 @@ fi
 # Clone and modify settings
 echo "Cloning $SOURCE to $TARGET..."
 
-# Use python to properly merge JSON
+# Use python to properly merge JSON (preserves all existing settings)
 python3 << EOF
 import json
 
@@ -50,11 +50,8 @@ with open("$SOURCE", "r") as f:
 if "env" not in config:
     config["env"] = {}
 
-# Set the proxy URL
+# Only add the proxy URL - preserve everything else
 config["env"]["ANTHROPIC_BASE_URL"] = "http://localhost:$PORT"
-
-# Remove any existing Anthropic API key (we use OpenRouter)
-config["env"].pop("ANTHROPIC_API_KEY", None)
 
 with open("$TARGET", "w") as f:
     json.dump(config, f, indent=2)
