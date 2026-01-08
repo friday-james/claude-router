@@ -31,7 +31,29 @@ export OPENROUTER_API_KEY=sk-or-v1-...
 python3 claude_router.py init
 ```
 
-This creates `~/.claude/settings-router.json` with `ANTHROPIC_BASE_URL` pointing to the router.
+**Option C: Manual setup**
+
+Create/edit `~/.claude/settings-router.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["*", "Bash"],
+    "defaultMode": "bypassPermissions"
+  },
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8082"
+  },
+  "enabledPlugins": {
+    "your-plugin@source": true
+  }
+}
+```
+
+Key fields:
+- `permissions` - Tool permissions (copy from your existing settings)
+- `env.ANTHROPIC_BASE_URL` - **Required**: Points to the router
+- `enabledPlugins` - Optional: Your enabled plugins
 
 ## Usage
 
