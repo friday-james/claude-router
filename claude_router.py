@@ -985,17 +985,25 @@ class ClaudeRouterHandler(BaseHTTPRequestHandler):
                     try:
                         with urlopen(req, timeout=120) as response:
                             data = json.loads(response.read().decode())
+                            print(f"Gemini response: {json.dumps(data)[:200]}...")
                             claude_response = convert_gemini_to_claude(data, model)
+                            print(f"Claude response: {json.dumps(claude_response)[:200]}...")
 
                             self.send_response(200)
                             self.send_header("Content-Type", "application/json")
                             self.send_cors_headers()
                             self.end_headers()
                             self.wfile.write(json.dumps(claude_response).encode())
+                            print("Response sent successfully")
                     except HTTPError as e:
                         error_body = e.read().decode()
-                        print(f"Gemini error: {error_body}", file=sys.stderr)
+                        print(f"Gemini HTTPError: {error_body}", file=sys.stderr)
                         self.send_error(e.code, error_body)
+                    except Exception as e:
+                        print(f"Gemini error: {type(e).__name__}: {str(e)}", file=sys.stderr)
+                        import traceback
+                        traceback.print_exc()
+                        self.send_error(500, f"Internal server error: {str(e)}")
                 else:
                     # Use OpenRouter
                     openrouter_request = convert_claude_to_openrouter(claude_request, model, api_key)
@@ -1283,8 +1291,13 @@ class ClaudeRouterHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(claude_response).encode())
         except HTTPError as e:
             error_body = e.read().decode()
-            print(f"OpenRouter error: {error_body}", file=sys.stderr)
+            print(f"OpenRouter HTTPError: {error_body}", file=sys.stderr)
             self.send_error(e.code, error_body)
+        except Exception as e:
+            print(f"OpenRouter error: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            self.send_error(500, f"Internal server error: {str(e)}")
 
     def handle_streaming_response(self, req: Request, model: str):
         """Handle streaming response"""
@@ -1322,8 +1335,13 @@ class ClaudeRouterHandler(BaseHTTPRequestHandler):
 
         except HTTPError as e:
             error_body = e.read().decode()
-            print(f"OpenRouter streaming error: {error_body}", file=sys.stderr)
+            print(f"OpenRouter streaming HTTPError: {error_body}", file=sys.stderr)
             self.send_error(e.code, error_body)
+        except Exception as e:
+            print(f"OpenRouter streaming error: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            self.send_error(500, f"Internal server error: {str(e)}")
 
 
 def supports_system_prompt_from_model_data(model: dict) -> bool:
