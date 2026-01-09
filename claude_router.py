@@ -292,10 +292,10 @@ You MUST use the available tools to complete tasks. DO NOT write plans or explan
 3. DO NOT describe what you would do - ACTUALLY DO IT by calling tools
 4. Call tools BEFORE writing any analysis or explanation
 
-## Tool Call Format (XML):
+## Tool Call Format - YOU MUST USE XML FORMAT:
 <tool_call><tool><name>TOOL_NAME</name><arguments>{{"param": "value"}}</arguments></tool></tool_call>
 
-## Examples:
+## CORRECT Examples (XML format):
 
 User: List files in current directory
 Assistant: <tool_call><tool><name>Bash</name><arguments>{{"command": "ls -la"}}</arguments></tool></tool_call>
@@ -303,13 +303,22 @@ Assistant: <tool_call><tool><name>Bash</name><arguments>{{"command": "ls -la"}}<
 User: Read the README file
 Assistant: <tool_call><tool><name>Read</name><arguments>{{"file_path": "README.md"}}</arguments></tool></tool_call>
 
-User: Find all Python files
-Assistant: <tool_call><tool><name>Glob</name><arguments>{{"pattern": "**/*.py"}}</arguments></tool></tool_call>
+User: Explore the codebase
+Assistant: <tool_call><tool><name>Task</name><arguments>{{"description": "Explore codebase", "prompt": "Explore the codebase.", "subagent_type": "Explore"}}</arguments></tool></tool_call>
 
-User: Search for imports
-Assistant: <tool_call><tool><name>Grep</name><arguments>{{"pattern": "^import ", "path": ".""}}</arguments></tool></tool_call>
+User: Add a todo
+Assistant: <tool_call><tool><name>TodoWrite</name><arguments>{{"todos": [{{"content": "Task description", "status": "in_progress", "activeForm": "Doing task"}}]}}</arguments></tool></tool_call>
 
-IMPORTANT: Call tools immediately when you need information. Tool results will be provided automatically."""
+## WRONG Examples (DO NOT USE THESE):
+❌ print(TodoWrite(todos=[...]))
+❌ print(Task(description="...", prompt="...", subagent_type="..."))
+❌ TodoWrite(todos=[...])
+❌ Task(description="...")
+
+IMPORTANT:
+- Use ONLY the XML format shown above
+- DO NOT use Python function calls or print statements
+- Tool results will be provided automatically after you make the call"""
 
 
 def parse_tool_calls_from_response(text: str) -> list:
@@ -348,6 +357,66 @@ def parse_tool_calls_from_response(text: str) -> list:
                 })
             except json.JSONDecodeError:
                 pass
+
+    # Try Python-style function calls: print(ToolName(...)) or ToolName(...)
+    if not tool_calls:
+        # Pattern to match: print(ToolName(args)) or ToolName(args)
+        # Common tool names from Claude Code
+        tool_names = ['TodoWrite', 'Task', 'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+                      'WebFetch', 'WebSearch', 'AskUserQuestion', 'Skill', 'EnterPlanMode']
+
+        for tool_name in tool_names:
+            # Match: print(ToolName(...)) or just ToolName(...)
+            pattern = rf'(?:print\s*\()?\s*{tool_name}\s*\((.*?)\)\s*(?:\))?'
+            matches = re.finditer(pattern, text, re.DOTALL)
+
+            for match in matches:
+                args_str = match.group(1).strip()
+                if not args_str:
+                    continue
+
+                try:
+                    # Try to parse as Python keyword arguments
+                    # Convert Python syntax to JSON: key=value -> "key": value
+                    # This is a simplified parser for common cases
+                    args_dict = {}
+
+                    # For TodoWrite, extract todos list
+                    if tool_name == 'TodoWrite' and 'todos=' in args_str:
+                        todos_match = re.search(r'todos\s*=\s*(\[.*?\])', args_str, re.DOTALL)
+                        if todos_match:
+                            todos_str = todos_match.group(1)
+                            # Replace Python True/False with JSON true/false
+                            todos_str = todos_str.replace("'", '"')
+                            try:
+                                todos = json.loads(todos_str)
+                                args_dict['todos'] = todos
+                            except:
+                                pass
+
+                    # For Task, extract parameters
+                    elif tool_name == 'Task':
+                        for param in ['description', 'prompt', 'subagent_type', 'model']:
+                            param_match = re.search(rf'{param}\s*=\s*["\']([^"\']+)["\']', args_str)
+                            if param_match:
+                                args_dict[param] = param_match.group(1)
+
+                    # For other tools, try generic parsing
+                    else:
+                        # Match key="value" or key='value' pairs
+                        for param_match in re.finditer(r'(\w+)\s*=\s*["\']([^"\']*)["\']', args_str):
+                            key, value = param_match.groups()
+                            args_dict[key] = value
+
+                    if args_dict:
+                        tool_calls.append({
+                            "id": f"tool_{uuid.uuid4().hex[:8]}",
+                            "name": tool_name,
+                            "input": args_dict
+                        })
+                except Exception as e:
+                    # If parsing fails, skip this match
+                    pass
 
     # Also try JSON format: {"name": "...", "arguments": {...}}
     # Use a more robust approach: find JSON-like patterns and try to parse them
