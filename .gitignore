@@ -15,3 +15,7 @@ build/
 *.swp
 *.swo
 .DS_Store
+
+# FewWord context plugin
+.fewword/scratch/
+.fewword/index/

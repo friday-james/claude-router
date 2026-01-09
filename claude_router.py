@@ -6,6 +6,8 @@ Claude Router - A proxy server that makes OpenRouter API compatible with Claude 
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -17,6 +19,7 @@ from urllib.error import HTTPError, URLError
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.claude/settings-router.json")
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 OPENROUTER_MODELS_URL = f"{OPENROUTER_API_BASE}/models"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
@@ -30,6 +33,17 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
 def get_openrouter_key(config: dict = None) -> Optional[str]:
     """Get OpenRouter API key from environment"""
     return os.environ.get("OPENROUTER_API_KEY")
+
+
+def get_gemini_key() -> Optional[str]:
+    """Get Gemini API key from environment"""
+    return os.environ.get("GEMINI_API_KEY")
+
+
+def should_use_gemini(model: str) -> bool:
+    """Check if we should use Gemini API directly"""
+    gemini_key = get_gemini_key()
+    return bool(gemini_key) and ("gemini" in model.lower() or model.startswith("google/"))
 
 
 def fetch_models(api_key: Optional[str] = None) -> list:
@@ -187,12 +201,15 @@ def convert_claude_to_openrouter(claude_request: dict, model: str, api_key: str 
     messages = []
 
     system_prompt = claude_request.get("system", "")
-    supports_system = model_supports_system_prompt(model, api_key)
 
-    # Handle system prompt - either as system message or prepend to first user message
-    prepend_system = system_prompt if (system_prompt and not supports_system) else None
-    if system_prompt and supports_system:
-        messages.append({"role": "system", "content": system_prompt})
+    # Inject tools into system prompt if present
+    tools = claude_request.get("tools", [])
+    if tools:
+        tools_instructions = format_tools_for_prompt(tools)
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{tools_instructions}"
+        else:
+            system_prompt = tools_instructions
 
     # Convert Claude messages to OpenAI format
     first_user_done = False
@@ -209,15 +226,21 @@ def convert_claude_to_openrouter(claude_request: dict, model: str, api_key: str 
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif block.get("type") == "image":
-                        # Handle image content if needed
                         pass
+                    elif block.get("type") == "tool_result":
+                        # Format tool result for the model
+                        tool_name = block.get("tool_use", {}).get("name", "unknown")
+                        result = block.get("content", "")
+                        if isinstance(result, list):
+                            result = "\n".join(str(r) for r in result)
+                        text_parts.append(f"Tool {tool_name} result: {result}")
                 elif isinstance(block, str):
                     text_parts.append(block)
             content = "\n".join(text_parts)
 
-        # Prepend system prompt to first user message if model doesn't support system
-        if prepend_system and role == "user" and not first_user_done:
-            content = f"{prepend_system}\n\n---\n\n{content}"
+        # Always prepend system prompt to first user message
+        if system_prompt and role == "user" and not first_user_done:
+            content = f"{system_prompt}\n\n---\n\n{content}"
             first_user_done = True
 
         messages.append({"role": role, "content": content})
@@ -241,6 +264,125 @@ def convert_claude_to_openrouter(claude_request: dict, model: str, api_key: str 
     return openrouter_request
 
 
+def format_tools_for_prompt(tools: list) -> str:
+    """Format tools as instructions for the model to call them"""
+    tools_json = json.dumps(tools, indent=2)
+
+    # Generate examples for each tool
+    tool_examples = []
+    for t in tools[:5]:
+        name = t.get("name")
+        schema = t.get("input_schema", {})
+        props = schema.get("properties", {})
+        args = {k: "value" for k in props}
+        tool_examples.append(f'<tool_call><tool><name>{name}</name><arguments>{json.dumps(args)}</arguments></tool></tool_call>')
+
+    examples = "\n".join(tool_examples)
+
+    return f"""# TOOL CALLING INSTRUCTIONS
+
+You MUST use the available tools to complete tasks. DO NOT write plans or explanations without using tools first.
+
+## Available Tools:
+{tools_json}
+
+## CRITICAL RULES:
+1. When you need information, IMMEDIATELY call the appropriate tool
+2. DO NOT write implementation plans - USE TOOLS to explore and gather information
+3. DO NOT describe what you would do - ACTUALLY DO IT by calling tools
+4. Call tools BEFORE writing any analysis or explanation
+
+## Tool Call Format (XML):
+<tool_call><tool><name>TOOL_NAME</name><arguments>{{"param": "value"}}</arguments></tool></tool_call>
+
+## Examples:
+
+User: List files in current directory
+Assistant: <tool_call><tool><name>Bash</name><arguments>{{"command": "ls -la"}}</arguments></tool></tool_call>
+
+User: Read the README file
+Assistant: <tool_call><tool><name>Read</name><arguments>{{"file_path": "README.md"}}</arguments></tool></tool_call>
+
+User: Find all Python files
+Assistant: <tool_call><tool><name>Glob</name><arguments>{{"pattern": "**/*.py"}}</arguments></tool></tool_call>
+
+User: Search for imports
+Assistant: <tool_call><tool><name>Grep</name><arguments>{{"pattern": "^import ", "path": ".""}}</arguments></tool></tool_call>
+
+IMPORTANT: Call tools immediately when you need information. Tool results will be provided automatically."""
+
+
+def parse_tool_calls_from_response(text: str) -> list:
+    """Parse tool calls from model response"""
+    import re
+    tool_calls = []
+
+    # Match <tool_call><tool><name>...</name><arguments>{...}</arguments></tool></tool_call>
+    pattern = r'<tool_call>\s*<tool>\s*<name>\s*([^<]+)\s*</name>\s*<arguments>\s*(\{.*?\})\s*</arguments>\s*</tool>\s*</tool_call>'
+
+    for match in re.finditer(pattern, text, re.DOTALL):
+        name = match.group(1).strip()
+        args_str = match.group(2)
+        try:
+            args = json.loads(args_str)
+            tool_calls.append({
+                "id": f"tool_{uuid.uuid4().hex[:8]}",
+                "name": name,
+                "input": args
+            })
+        except json.JSONDecodeError:
+            pass
+
+    # Also try simpler pattern (without <tool> wrapper)
+    if not tool_calls:
+        pattern2 = r'<tool_call>\s*<name>\s*([^<]+)\s*</name>\s*<arguments>\s*(\{.*?\})\s*</arguments>'
+        for match in re.finditer(pattern2, text, re.DOTALL):
+            name = match.group(1).strip()
+            args_str = match.group(2)
+            try:
+                args = json.loads(args_str)
+                tool_calls.append({
+                    "id": f"tool_{uuid.uuid4().hex[:8]}",
+                    "name": name,
+                    "input": args
+                })
+            except json.JSONDecodeError:
+                pass
+
+    # Also try JSON format: {"name": "...", "arguments": {...}}
+    # Use a more robust approach: find JSON-like patterns and try to parse them
+    if not tool_calls:
+        # Find all potential JSON objects starting with {"name":
+        import re
+        idx = 0
+        while idx < len(text):
+            # Look for start of a potential tool call JSON
+            match = re.search(r'\{\s*"name"\s*:', text[idx:])
+            if not match:
+                break
+
+            start = idx + match.start()
+            # Try to find the matching closing brace by parsing JSON
+            for end in range(start + 10, min(start + 1000, len(text) + 1)):
+                try:
+                    potential_json = text[start:end]
+                    obj = json.loads(potential_json)
+                    if "name" in obj and "arguments" in obj:
+                        tool_calls.append({
+                            "id": f"tool_{uuid.uuid4().hex[:8]}",
+                            "name": obj["name"],
+                            "input": obj["arguments"]
+                        })
+                        idx = end
+                        break
+                except json.JSONDecodeError:
+                    continue
+            else:
+                idx = start + 1
+
+    return tool_calls
+
+
 def convert_openrouter_to_claude(openrouter_response: dict, model: str) -> dict:
     """Convert OpenRouter (OpenAI) response format to Claude format"""
 
@@ -252,9 +394,25 @@ def convert_openrouter_to_claude(openrouter_response: dict, model: str) -> dict:
     if choices:
         choice = choices[0]
         message = choice.get("message", {})
-        text = message.get("content", "")
+        text = message.get("content", "") or ""
 
-        if text:
+        # Parse tool calls from the text
+        tool_calls = parse_tool_calls_from_response(text)
+
+        if tool_calls:
+            # For each tool call, create a tool_use block and remove the call from text
+            for call in tool_calls:
+                content.append({
+                    "type": "tool_use",
+                    "id": call["id"],
+                    "name": call["name"],
+                    "input": call["input"]
+                })
+            # Also include the text before tool calls (with tool calls removed)
+            clean_text = strip_tool_calls(text)
+            if clean_text.strip():
+                content.insert(0, {"type": "text", "text": clean_text})
+        elif text:
             content.append({"type": "text", "text": text})
 
         # Map finish_reason to Claude stop_reason
@@ -281,6 +439,342 @@ def convert_openrouter_to_claude(openrouter_response: dict, model: str) -> dict:
             "output_tokens": usage.get("completion_tokens", 0),
         }
     }
+
+
+def strip_tool_calls(text: str) -> str:
+    """Remove tool call XML tags from text"""
+    import re
+    # Remove <tool_call>...</tool_call> blocks
+    text = re.sub(r'<tool_call>\s*<tool>.*?</tool>\s*</tool_call>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<tool_call>\s*<name>.*?</name>\s*<arguments>.*?</arguments>\s*</tool_call>', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
+# ============== Gemini API Support ==============
+
+def convert_claude_to_gemini(claude_request: dict) -> dict:
+    """Convert Claude API request to Gemini API format"""
+    contents = []
+    system_instruction = claude_request.get("system", "")
+
+    # Add tools to system instruction
+    tools = claude_request.get("tools", [])
+    if tools:
+        tools_instructions = format_tools_for_prompt(tools)
+        if system_instruction:
+            system_instruction = f"{system_instruction}\n\n{tools_instructions}"
+        else:
+            system_instruction = tools_instructions
+
+    # Convert messages
+    for msg in claude_request.get("messages", []):
+        role = msg.get("role")
+        content = msg.get("content")
+
+        # Extract text from content blocks
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            content = "\n".join(text_parts)
+
+        # Gemini uses "user" and "model" roles
+        gemini_role = "model" if role == "assistant" else "user"
+
+        # Add system instruction to first user message
+        if gemini_role == "user" and system_instruction and not contents:
+            content = f"{system_instruction}\n\n---\n\n{content}"
+            system_instruction = ""  # Only add once
+
+        contents.append({
+            "role": gemini_role,
+            "parts": [{"text": content}]
+        })
+
+    return {
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": claude_request.get("max_tokens", 2048),
+            "temperature": claude_request.get("temperature", 1.0),
+            "topP": claude_request.get("top_p", 0.95),
+        }
+    }
+
+
+def convert_gemini_to_claude(gemini_response: dict, model: str) -> dict:
+    """Convert Gemini API response to Claude format"""
+    candidates = gemini_response.get("candidates", [])
+
+    content = []
+    stop_reason = "end_turn"
+
+    if candidates:
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+
+        # Combine all text parts
+        text = "".join(part.get("text", "") for part in parts if "text" in part)
+
+        # Parse tool calls from text
+        tool_calls = parse_tool_calls_from_response(text)
+
+        if tool_calls:
+            # Add tool_use blocks
+            for call in tool_calls:
+                content.append({
+                    "type": "tool_use",
+                    "id": call["id"],
+                    "name": call["name"],
+                    "input": call["input"]
+                })
+            # Add remaining text
+            clean_text = strip_tool_calls(text)
+            if clean_text.strip():
+                content.insert(0, {"type": "text", "text": clean_text})
+        elif text:
+            content.append({"type": "text", "text": text})
+
+        # Map finish reason
+        finish_reason = candidate.get("finishReason", "STOP")
+        if finish_reason == "MAX_TOKENS":
+            stop_reason = "max_tokens"
+
+    # Get usage
+    usage_metadata = gemini_response.get("usageMetadata", {})
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage_metadata.get("promptTokenCount", 0),
+            "output_tokens": usage_metadata.get("candidatesTokenCount", 0),
+        }
+    }
+
+
+# ============== Tool Executor ==============
+
+def execute_tool_call(tool_name: str, arguments: dict) -> str:
+    """Execute a tool call on the server"""
+    import subprocess
+    import os
+
+    if tool_name == "Bash":
+        cmd = arguments.get("command", "")
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            output = result.stdout.strip() if result.stdout.strip() else result.stderr.strip() if result.stderr.strip() else "(no output)"
+            return output
+        except subprocess.TimeoutExpired:
+            return "(command timed out)"
+        except Exception as e:
+            return f"(error: {str(e)})"
+
+    elif tool_name == "Read":
+        path = arguments.get("file_path", "")
+        try:
+            with open(path, 'r') as f:
+                return f.read()
+        except FileNotFoundError:
+            return f"(file not found: {path})"
+        except Exception as e:
+            return f"(error reading {path}: {str(e)})"
+
+    elif tool_name == "Glob":
+        pattern = arguments.get("pattern", "")
+        try:
+            import pathlib
+            matches = list(pathlib.Path(".").glob(pattern))
+            return "\n".join(str(m) for m in matches) if matches else "(no matches)"
+        except Exception as e:
+            return f"(error: {str(e)})"
+
+    elif tool_name == "Edit":
+        file_path = arguments.get("file_path", "")
+        old_string = arguments.get("old_string", "")
+        new_string = arguments.get("new_string", "")
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+            content = content.replace(old_string, new_string)
+            with open(file_path, 'w') as f:
+                f.write(content)
+            return "(file updated)"
+        except Exception as e:
+            return f"(error: {str(e)})"
+
+    elif tool_name == "Write":
+        file_path = arguments.get("file_path", "")
+        text = arguments.get("text", "")
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True) if os.path.dirname(file_path) else None
+            with open(file_path, 'w') as f:
+                f.write(text)
+            return "(file written)"
+        except Exception as e:
+            return f"(error: {str(e)})"
+
+    else:
+        return f"(unknown tool: {tool_name})"
+
+
+def detect_and_execute_python(text: str) -> tuple:
+    """Detect Python code blocks in text and execute them.
+    Returns (executed, output, remaining_text)"""
+    import re
+    import subprocess
+    import sys
+    import os
+
+    # Match Python code blocks (```python ... ``` or just ``` ... ```)
+    pattern = r'```(?:python)?\s*(.*?)\s*```'
+
+    matches = list(re.finditer(pattern, text, re.DOTALL))
+
+    if not matches:
+        return False, "", text
+
+    # Execute the first code block
+    match = matches[0]
+    code = match.group(1)
+
+    # Check if code tries to read a file
+    read_match = re.search(r'pd\.read_csv\s*\(\s*["\']([^"\']+)["\']', code)
+    if read_match:
+        file_path = read_match.group(1)
+        if os.path.exists(file_path):
+            try:
+                import pandas as pd
+                df = pd.read_csv(file_path)
+                # Return file contents as JSON for the model to work with
+                output = f"File loaded: {file_path}\nShape: {df.shape}\nColumns: {list(df.columns)}\nFirst 5 rows:\n{df.head().to_string()}"
+                remaining = text[:match.start()] + text[match.end():]
+                return True, output, remaining.strip()
+            except Exception as e:
+                pass
+
+    # Check if code uses pathlib.Path for directory listing
+    if 'pathlib.Path' in code or '.iterdir()' in code:
+        try:
+            import pathlib
+            path_match = re.search(r'Path\s*\(\s*["\']?([^"\')\s]+)["\']?\s*\)', code)
+            if path_match:
+                dir_path = pathlib.Path(path_match.group(1))
+            else:
+                dir_path = pathlib.Path(".")
+            items = list(dir_path.iterdir())
+            output = f"Directory: {dir_path}\nItems: {len(items)}\n" + "\n".join(str(i) for i in items[:20])
+            remaining = text[:match.start()] + text[match.end():]
+            return True, output, remaining.strip()
+        except Exception as e:
+            pass
+
+    # Check for os.listdir
+    if 'os.listdir' in code:
+        try:
+            dir_match = re.search(r'os\.listdir\s*\(\s*["\']?([^"\')\s]+)["\']?\s*\)', code)
+            if dir_match:
+                dir_path = dir_match.group(1)
+            else:
+                dir_path = "."
+            items = os.listdir(dir_path)
+            output = f"Directory: {dir_path}\nItems: {len(items)}\n" + "\n".join(items[:20])
+            remaining = text[:match.start()] + text[match.end():]
+            return True, output, remaining.strip()
+        except Exception as e:
+            pass
+
+    # Remove leading import lines that Python can't handle in -c mode
+    import_lines = []
+    other_lines = []
+    for line in code.split('\n'):
+        stripped = line.strip()
+        if stripped in ('import os', 'import pathlib', 'import pandas as pd', 'import numpy as np',
+                        'from pathlib import Path', 'from pathlib import Path as pathlib',
+                        'import pandas', 'import numpy'):
+            import_lines.append(stripped)
+        elif stripped and not stripped.startswith('#'):
+            other_lines.append(line)
+
+    # Build executable code
+    exec_code = '\n'.join(import_lines + other_lines)
+
+    if not exec_code.strip():
+        return False, "", text
+
+    try:
+        # Execute with timeout
+        result = subprocess.run(
+            [sys.executable, '-c', exec_code],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd="."
+        )
+        output = result.stdout.strip() if result.stdout.strip() else result.stderr.strip() if result.stderr.strip() else "(no output)"
+
+        # Remove the code block from text
+        remaining = text[:match.start()] + text[match.end():]
+        remaining = remaining.strip()
+
+        return True, output, remaining
+
+    except subprocess.TimeoutExpired:
+        return True, "(code execution timed out)", text[:match.start()] + text[match.end():]
+    except Exception as e:
+        return True, f"(execution error: {str(e)})", text[:match.start()] + text[match.end():]
+
+
+def convert_python_to_tool_call(code: str, api_key: str) -> dict:
+    """Use LLM to convert Python code to a tool call"""
+    import urllib.request
+
+    prompt = f"""Convert this Python code to a tool call. Choose the best tool (Bash, Read, Glob, Edit, Write):
+
+Python code:
+{code}
+
+Output format:
+<tool_call><tool><name>TOOL_NAME</name><arguments>{{"param": "value"}}</arguments></tool></tool_call>
+
+If the code cannot be converted to a tool call, output: NONE"""
+
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps({
+                "model": "anthropic/claude-sonnet-4-20250506",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 200
+            }).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://github.com/claude-router",
+                "X-Title": "Claude Router"
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode())
+            result = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            if result == "NONE":
+                return None
+
+            # Parse the tool call from the result
+            tool_calls = parse_tool_calls_from_response(result)
+            return tool_calls[0] if tool_calls else None
+
+    except Exception as e:
+        print(f"Error converting Python to tool call: {e}")
+        return None
 
 
 def convert_openrouter_stream_to_claude(chunk: dict, model: str, message_id: str, is_first: bool = False) -> list:
@@ -422,6 +916,17 @@ class ClaudeRouterHandler(BaseHTTPRequestHandler):
             claude_request = json.loads(body.decode())
             print(f"Request model: {claude_request.get('model')}")
 
+            # Log first message content
+            messages = claude_request.get('messages', [])
+            if messages:
+                first_msg = messages[0].get('content', '')
+                if isinstance(first_msg, str):
+                    print(f"First message: {first_msg[:100]}")
+                elif isinstance(first_msg, list):
+                    for block in first_msg[:1]:
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            print(f"First message: {block.get('text', '')[:100]}")
+
             api_key = get_openrouter_key(self.config)
             if not api_key:
                 print("ERROR: No API key!")
@@ -435,31 +940,88 @@ class ClaudeRouterHandler(BaseHTTPRequestHandler):
                 return
             print(f"Using model: {model}")
 
-            # Convert request format
-            openrouter_request = convert_claude_to_openrouter(claude_request, model, api_key)
-
             # Check if streaming
-            is_streaming = openrouter_request.get("stream", False)
+            is_streaming = claude_request.get("stream", False)
 
-            # Make request to OpenRouter
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "HTTP-Referer": "https://github.com/claude-router",
-                "X-Title": "Claude Router"
-            }
+            # Check if tools are present - use autonomous mode for tool execution
+            tools = claude_request.get("tools", [])
+            has_tools = bool(tools)
+            print(f"Tools in request: {len(tools)} tools, streaming: {is_streaming}")
+            if tools:
+                print(f"Tool names: {[t.get('name') for t in tools]}")
 
-            req = Request(
-                f"{OPENROUTER_API_BASE}/chat/completions",
-                data=json.dumps(openrouter_request).encode(),
-                headers=headers,
-                method="POST"
-            )
+            # Don't use autonomous mode - let Claude Code execute tools
+            # if has_tools:
+            #     print("Using autonomous mode (server-side tool execution)")
+            #     claude_request["stream"] = False
+            #     claude_response = self.run_autonomous(claude_request, model, api_key)
+            #     ...
+            # else:
 
-            if is_streaming:
-                self.handle_streaming_response(req, model)
-            else:
-                self.handle_normal_response(req, model)
+            if True:  # Always use passthrough mode
+                # Normal passthrough mode (no tools or simple chat)
+                use_gemini = should_use_gemini(model)
+
+                if use_gemini:
+                    # Use Gemini API directly
+                    gemini_key = get_gemini_key()
+                    if "/" in model:
+                        gemini_model_name = model.split("/", 1)[1].replace(":free", "")
+                    else:
+                        gemini_model_name = model
+
+                    print(f"Using Gemini API (non-autonomous): {gemini_model_name}")
+
+                    gemini_request = convert_claude_to_gemini(claude_request)
+                    url = f"{GEMINI_API_BASE}/models/{gemini_model_name}:generateContent?key={gemini_key}"
+
+                    req = Request(
+                        url,
+                        data=json.dumps(gemini_request).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+
+                    try:
+                        with urlopen(req, timeout=120) as response:
+                            data = json.loads(response.read().decode())
+                            claude_response = convert_gemini_to_claude(data, model)
+
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_cors_headers()
+                            self.end_headers()
+                            self.wfile.write(json.dumps(claude_response).encode())
+                    except HTTPError as e:
+                        error_body = e.read().decode()
+                        print(f"Gemini error: {error_body}", file=sys.stderr)
+                        self.send_error(e.code, error_body)
+                else:
+                    # Use OpenRouter
+                    openrouter_request = convert_claude_to_openrouter(claude_request, model, api_key)
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                        "HTTP-Referer": "https://github.com/claude-router",
+                        "X-Title": "Claude Router"
+                    }
+
+                    if is_streaming:
+                        req = Request(
+                            f"{OPENROUTER_API_BASE}/chat/completions",
+                            data=json.dumps(openrouter_request).encode(),
+                            headers=headers,
+                            method="POST"
+                        )
+                        self.handle_streaming_response(req, model)
+                    else:
+                        req = Request(
+                            f"{OPENROUTER_API_BASE}/chat/completions",
+                            data=json.dumps(openrouter_request).encode(),
+                            headers=headers,
+                            method="POST"
+                        )
+                        self.handle_normal_response(req, model)
 
         except json.JSONDecodeError:
             self.send_error(400, "Invalid JSON")
@@ -467,12 +1029,252 @@ class ClaudeRouterHandler(BaseHTTPRequestHandler):
             print(f"Error: {e}", file=sys.stderr)
             self.send_error(500, str(e))
 
+    def run_autonomous(self, claude_request: dict, model: str, api_key: str) -> dict:
+        """Run request with autonomous tool execution"""
+        use_gemini = should_use_gemini(model)
+
+        if use_gemini:
+            gemini_key = get_gemini_key()
+            # Extract model name from "google/gemini-..." format
+            if "/" in model:
+                gemini_model_name = model.split("/", 1)[1].replace(":free", "")
+            else:
+                gemini_model_name = model
+
+            print(f"Using Gemini API directly with model: {gemini_model_name}")
+        else:
+            print(f"Using OpenRouter API")
+
+        # Build conversation
+        messages = []
+        system = claude_request.get("system", "")
+        tools = claude_request.get("tools", [])
+
+        # Inject tools into system prompt if present
+        if tools:
+            tools_instructions = format_tools_for_prompt(tools)
+            if system:
+                system = f"{system}\n\n{tools_instructions}"
+            else:
+                system = tools_instructions
+
+        request_messages = claude_request.get("messages", [])
+
+        # Convert Claude messages to appropriate format
+        first_user_done = False
+        for msg in request_messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(text_parts)
+
+            # Prepend system to first user message
+            if system and role == "user" and not first_user_done:
+                content = f"{system}\n\n---\n\n{content}"
+                first_user_done = True
+
+            messages.append({"role": role, "content": content})
+
+        max_iterations = 20  # Prevent infinite loops
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            try:
+                if use_gemini:
+                    # Build Gemini request
+                    gemini_contents = []
+                    for msg in messages:
+                        gemini_role = "model" if msg["role"] == "assistant" else "user"
+                        gemini_contents.append({
+                            "role": gemini_role,
+                            "parts": [{"text": msg["content"]}]
+                        })
+
+                    gemini_request = {
+                        "contents": gemini_contents,
+                        "generationConfig": {
+                            "maxOutputTokens": 2048,
+                            "temperature": 1.0,
+                        }
+                    }
+
+                    # Make request to Gemini API
+                    url = f"{GEMINI_API_BASE}/models/{gemini_model_name}:generateContent?key={gemini_key}"
+                    req = Request(
+                        url,
+                        data=json.dumps(gemini_request).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+
+                    with urlopen(req, timeout=120) as response:
+                        data = json.loads(response.read().decode())
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            response_text = "".join(part.get("text", "") for part in parts if "text" in part)
+                        else:
+                            response_text = ""
+                else:
+                    # Build OpenRouter request
+                    openrouter_request = {
+                        "model": model,
+                        "messages": messages,
+                    }
+
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                        "HTTP-Referer": "https://github.com/claude-router",
+                        "X-Title": "Claude Router"
+                    }
+
+                    # Make request to OpenRouter
+                    req = Request(
+                        f"{OPENROUTER_API_BASE}/chat/completions",
+                        data=json.dumps(openrouter_request).encode(),
+                        headers=headers,
+                        method="POST"
+                    )
+
+                    with urlopen(req, timeout=120) as response:
+                        data = json.loads(response.read().decode())
+                        response_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                # First check for and execute Python code
+                py_executed, py_output, clean_text = detect_and_execute_python(response_text)
+                clean_text = clean_text or ""  # Ensure clean_text is always defined
+
+                if py_executed:
+                    print(f"Iteration {iteration}: Executed Python code directly")
+                    print(f"  Output: {py_output[:100]}{'...' if len(py_output) > 100 else ''}")
+                    # Add assistant message first
+                    messages.append({
+                        "role": "assistant",
+                        "content": response_text
+                    })
+                    # Add result as user message, including remaining text
+                    messages.append({
+                        "role": "user",
+                        "content": f"Code execution result:\n{py_output}\n\n{clean_text}".strip()
+                    })
+                    continue
+
+                # Check if response contains Python code that needs LLM conversion
+                python_pattern = r'```(?:python)?\s*(import\s+os|import\s+pathlib|from\s+pathlib|pathlib\.Path|\.iterdir\(\)|\.glob\(|\.read\(\)|\.write\()'
+                if re.search(python_pattern, response_text):
+                    # Extract the code
+                    code_match = re.search(r'```(?:python)?\s*(.*?)\s*```', response_text, re.DOTALL)
+                    if code_match:
+                        code = code_match.group(1)
+                        print(f"Iteration {iteration}: Converting Python to tool call via LLM...")
+                        # Use LLM to convert to tool call
+                        tool_call = convert_python_to_tool_call(code, api_key)
+
+                        if tool_call:
+                            tool_name = tool_call.get("name")
+                            arguments = tool_call.get("input", {})
+                            print(f"  LLM suggested: {tool_name}({arguments})")
+                            result = execute_tool_call(tool_name, arguments)
+                            print(f"  Result: {result[:100]}{'...' if len(result) > 100 else ''}")
+
+                            # Remove code from response
+                            clean_text = re.sub(r'```(?:python)?\s*.*?\s*```', '', response_text, flags=re.DOTALL).strip()
+
+                            # Add assistant message first
+                            messages.append({
+                                "role": "assistant",
+                                "content": response_text
+                            })
+                            messages.append({
+                                "role": "user",
+                                "content": f"Tool {tool_name} result:\n{result}\n\n{clean_text}".strip()
+                            })
+                            continue
+                        else:
+                            print("  LLM could not convert to tool call")
+
+                # Check for tool calls
+                tool_calls = parse_tool_calls_from_response(response_text)
+
+                if tool_calls:
+                    print(f"Iteration {iteration}: Found {len(tool_calls)} tool call(s)")
+
+                    # Add assistant's message first
+                    messages.append({
+                        "role": "assistant",
+                        "content": response_text
+                    })
+
+                    # Execute each tool call and add results
+                    for call in tool_calls:
+                        tool_name = call.get("name")
+                        arguments = call.get("input", {})
+                        print(f"  Executing: {tool_name}({arguments})")
+                        result = execute_tool_call(tool_name, arguments)
+                        print(f"  Result: {result[:100]}{'...' if len(result) > 100 else ''}")
+
+                        # Add result as user message
+                        messages.append({
+                            "role": "user",
+                            "content": f"Tool {tool_name} result: {result}"
+                        })
+                    # Continue to next iteration
+                    continue
+                else:
+                    # No tool calls or code, we're done
+                    print(f"Iteration {iteration}: No more tool calls/code, done")
+                    # Build Claude response with the clean text (code removed)
+                    if clean_text:
+                        claude_data = data.copy()
+                        claude_data["choices"] = [{"message": {"content": clean_text}, "finish_reason": "stop"}]
+                        return convert_openrouter_to_claude(claude_data, model)
+                    return convert_openrouter_to_claude(data, model)
+
+            except HTTPError as e:
+                error_body = e.read().decode()
+                print(f"OpenRouter error: {error_body}")
+                self.send_error(e.code, error_body)
+                return {"error": error_body}
+
+        # Max iterations reached
+        print(f"Max iterations ({max_iterations}) reached")
+        return {
+            "error": f"Max iterations ({max_iterations}) reached",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"(Task did not complete within {max_iterations} iterations)"}]
+        }
+
     def handle_normal_response(self, req: Request, model: str):
         """Handle non-streaming response"""
         try:
             with urlopen(req, timeout=120) as response:
                 data = json.loads(response.read().decode())
+
+                # Log the raw response
+                raw_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                print(f"OpenRouter response: {raw_text[:200]}")
+
                 claude_response = convert_openrouter_to_claude(data, model)
+
+                # Log what we're returning
+                content = claude_response.get("content", [])
+                if content:
+                    first_block = content[0]
+                    if first_block.get("type") == "text":
+                        print(f"Returning text: {first_block.get('text', '')[:100]}")
+                    elif first_block.get("type") == "tool_use":
+                        print(f"Returning tool_use: {first_block.get('name')} with {first_block.get('input')}")
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -689,6 +1491,7 @@ Examples:
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
     serve_parser.add_argument("--port", "-p", type=int, default=8082, help="Port to listen on (default: 8082)")
     serve_parser.add_argument("--config", "-c", help="Path to config file")
+    serve_parser.add_argument("--model", "-m", help="Default model to use")
 
     # Init command
     subparsers.add_parser("init", help="Create example config file")
@@ -711,9 +1514,13 @@ Examples:
         host = args.host or config.get("server", {}).get("host", "127.0.0.1")
         port = args.port or config.get("server", {}).get("port", 8082)
 
-        # Interactive model selection
+        # Use --model if provided, otherwise interactive selection
         api_key = get_openrouter_key(config)
-        model = select_model_interactive(api_key)
+        if args.model:
+            model = args.model
+            print(f"Using model: {model}")
+        else:
+            model = select_model_interactive(api_key)
 
         run_server(host, port, config, model)
 
